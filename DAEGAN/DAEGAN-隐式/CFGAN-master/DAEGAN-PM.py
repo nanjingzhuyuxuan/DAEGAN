@@ -1,0 +1,206 @@
+# -*- coding: utf-8 -*-
+import random
+import copy
+import numpy as np
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from torch.autograd import Variable
+import data
+import cfgan
+import warnings
+import math
+import time
+warnings.filterwarnings("ignore")
+
+def select_negative_items(realData, num_pm, itemCount):
+
+    data = np.array(realData)
+    n_items_pm = np.zeros_like(data)
+    n_items_zr = np.zeros_like(data)
+    for i in range(data.shape[0]):
+        p_items = np.where(data[i] != 0)[0]
+        all_item_index = random.sample(range(data.shape[1]), itemCount)
+        for j in range(p_items.shape[0]):
+            all_item_index.remove(list(p_items)[j])
+        random.shuffle(all_item_index)
+        n_item_index_pm = all_item_index[0: num_pm]
+        n_items_pm[i][n_item_index_pm] = 1
+    return n_items_pm, n_items_zr
+
+def computeTopN(groundTruth, result, topN):
+
+    result = result.tolist()
+    for i in range(len(result)):
+        result[i] = (result[i], i)
+    result.sort(key=lambda x: x[0], reverse=True)
+    hit = 0
+
+    for i in range(topN):
+        if (result[i][1] in groundTruth):
+            hit = hit + 1
+
+    p = hit / topN
+
+    r = hit / len(groundTruth)
+
+    DCG = 0
+    IDCG = 0
+
+    for i in range(topN):
+        if (result[i][1] in groundTruth):
+            DCG += 1.0 / math.log(i + 2)
+
+    for i in range(topN):
+        IDCG += 1.0 / math.log(i + 2)
+    ndcg = DCG / IDCG
+    return p, r, ndcg
+
+
+def main(userCount, itemCount, testSet, trainVector, trainMaskVector, topN, epochCount, alpha, ):
+    result_precision = np.zeros((1, 2))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    G = cfgan.generator(itemCount).to(device)
+    D = cfgan.discriminator(itemCount).to(device)
+    regularization = nn.MSELoss()
+    d_optimizer = torch.optim.Adam(D.parameters(), lr=0.001)
+    g_optimizer = torch.optim.Adam(G.parameters(), lr=0.001)
+    G_step = 5
+    D_step = 2
+    batchSize_G = 32
+    batchSize_D = 32
+
+    for epoch in range(epochCount):
+
+        for step in range(G_step):
+
+            leftIndex = random.randint(1, userCount - batchSize_G - 1)
+            realData = Variable(copy.deepcopy(trainVector[leftIndex:leftIndex + batchSize_G]))
+
+            eu = Variable(copy.deepcopy(trainVector[leftIndex:leftIndex + batchSize_G])).to(device)
+
+            n_items_pm, _ = select_negative_items(realData, pro_PM, itemCount)
+            ku_zp = Variable(torch.tensor(n_items_pm)).to(device)
+            realData_zp = Variable(torch.ones_like(realData)).to(device) * eu + Variable(torch.zeros_like(realData)).to(
+                device) * ku_zp
+
+            fakeData = G(realData.to(device)).to(device)
+            fakeData_ZP = fakeData * (eu + ku_zp)
+            fakeData_result = D(fakeData_ZP.to(device))
+
+            g_loss = np.mean(np.log(1. - fakeData_result.detach().cpu().numpy() + 10e-5)) + alpha * regularization(
+                fakeData_ZP, realData_zp)
+            g_optimizer.zero_grad()
+            g_loss.backward(retain_graph=True)
+            g_optimizer.step()
+
+        for step in range(D_step):
+
+            leftIndex = random.randint(1, userCount - batchSize_D - 1)
+            realData = Variable(copy.deepcopy(trainVector[leftIndex:leftIndex + batchSize_D]))
+
+
+            n_items_pm, _ = select_negative_items(realData, pro_PM, itemCount)
+            ku = Variable(torch.tensor(n_items_pm)).to(device)
+
+            fakeData = G(realData.to(device))
+            eu = Variable(copy.deepcopy(trainVector[leftIndex:leftIndex + batchSize_G])).to(device)
+            fakeData_ZP = fakeData * (eu + ku)
+
+
+            fakeData_result = D(fakeData_ZP.to(device))
+            realData_result = D(realData.to(device))
+            d_loss = -np.mean(np.log(realData_result.detach().cpu().numpy() + 10e-5) + np.log(
+                1. - fakeData_result.detach().cpu().numpy() + 10e-5)) + 0 * regularization(fakeData_ZP, realData_zp)
+            d_optimizer.zero_grad()
+            d_loss.backward(retain_graph=True)
+            d_optimizer.step()
+
+        if (epoch % 1 == 0):
+            n_user = len(testSet)
+            precisions_5 = 0
+            precisions_10 = 0
+            ndcg_5 = 0
+            ndcg_10 = 0
+            index = 0
+
+            for testUser in testSet.keys():
+                data = Variable(copy.deepcopy(trainVector[testUser])).to(device)
+
+                result = G(data.reshape(1, itemCount)) + Variable(copy.deepcopy(trainMaskVector[index])).to(device).to(
+                    device)
+                result = result.reshape(itemCount)
+
+                precision, recall, ndcg = computeTopN(testSet[testUser], result, 5)
+                precisions_5 += precision
+                ndcg_5 += ndcg
+
+                precision, recall, ndcg = computeTopN(testSet[testUser], result, 10)
+                precisions_10 += precision
+                ndcg_10 += ndcg
+                index += 1
+
+            precisions_5 = precisions_5 / n_user
+            precisions_10 = precisions_10 / n_user
+            ndcg_5 = ndcg_5 / n_user
+            ndcg_10 = ndcg_10 / n_user
+            result_precision = np.concatenate((result_precision, np.array([[epoch, precisions_5]])), axis=0)
+            print('Epoch[{}/{}],d_loss:{:.6f},g_loss:{:.6f},precision:{},precision:{},ndcg5:{},ndcg10:{}'.format(epoch,
+                                                                                                                 epochCount,
+                                                                                                                 d_loss.item(),
+                                                                                                                 g_loss.item(),
+                                                                                                                 precisions_5,
+                                                                                                                 precisions_10,
+                                                                                                                 ndcg_5,
+                                                                                                                 ndcg_10))
+
+    return result_precision
+
+def result_plt(result_precision, name):
+    plt.figure()
+    plt.title("the precision of CDAE-WGAN")
+    plt.xlabel('epoch')
+    plt.plot(result_precision[:, 0], result_precision[:, 1], "r-*", label='precision')
+    plt.ylim([0, 0.6])
+    plt.legend()
+    timestr = time.strftime("%Y%m%d-%H%M%S")
+    plt.savefig(name + timestr + '.png')
+    plt.show()
+
+
+if __name__ == '__main__':
+    topN = 5
+    epochs = 1000
+    pro_PM = 100
+    alpha = 0.1
+    config = {
+        '100k': {
+            'train': '../../code_ITVeALS/data/movielens 100k/train.csv',
+            'test': '../../code_ITVeALS/data/movielens 100k/test.csv',
+        },
+        'cd_movies': {
+            'train': '../../code_ITVeALS/data/cd_movies/train.csv',
+            'test': '../../code_ITVeALS/data/cd_movies/test.csv',
+        },
+        'ml1m': {
+            'train': '../../code_ITVeALS/data/ml1m/train.csv',
+            'test': '../../code_ITVeALS/data/ml1m/test.csv',
+        },
+    }
+
+    data_name = 'cd_movies'
+    data_config = config[data_name]
+    trainSet, train_use, train_item = data.loadTrainingData(data_config['train'], "\t")
+    testSet, test_use, test_item = data.loadTestData(data_config['test'], "\t")
+
+    userCount = max(train_use, test_use)
+    itemCount = max(train_item, test_item)
+    userList_test = list(testSet.keys())
+    trainVector, trainMaskVector, batchCount, = data.to_Vectors(trainSet, userCount, itemCount, userList_test)
+    result_precision, result_last = main(userCount, itemCount, testSet, trainVector, trainMaskVector, topN, epochs,
+                                         alpha)
+    result_precision = result_precision[1:, ]
+    result_plt(result_precision, data_name)
+
+
